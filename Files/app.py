@@ -11,12 +11,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Optional, Set
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import urllib3
+
+# Suppress urllib3 warnings about connection pool limits
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+urllib3.disable_warnings(urllib3.exceptions.PoolError)
 
 # --- Configuration ---
 DEFAULT_TIMEOUT = 15
-DEFAULT_MAX_WORKERS = 50
-DEFAULT_PING_TIMEOUT = 2.0
-DEFAULT_RETRIES = 2
+DEFAULT_MAX_WORKERS = 20
+DEFAULT_PING_TIMEOUT = 1.5
+DEFAULT_RETRIES = 1
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -72,7 +77,6 @@ PLAIN_SOURCES = [
     "https://raw.githubusercontent.com/LonUp/NodeList/main/V2RAY/Latest.txt",
     "https://raw.githubusercontent.com/mose-design/v2ray-server/main/config/v2ray-server.txt",
     "https://raw.githubusercontent.com/vakhov/free-v2ray-configs/main/configs.txt",
-    "https://mr-v2ray.top/free_v2ray/all_configs.txt",
     "https://sub.f94.top/api/v1/client/subscribe?token=4943f615f5d342a39626b84013444983",
     "https://raw.githubusercontent.com/HebeV2/HebeV2/main/free.txt",
     "https://raw.githubusercontent.com/alanbobs999/TopFreeProxies/master/Eternity.txt",
@@ -84,16 +88,20 @@ PLAIN_SOURCES = [
 
 # ------------------- UTILITIES -------------------
 
-def create_session_with_retries(retries: int = DEFAULT_RETRIES, timeout: int = DEFAULT_TIMEOUT) -> requests.Session:
+def create_session_with_retries(retries: int = DEFAULT_RETRIES, timeout: int = DEFAULT_TIMEOUT, pool_connections: int = 50, pool_maxsize: int = 50) -> requests.Session:
     """Create a requests session with retry strategy and connection pooling."""
     session = requests.Session()
     retry_strategy = Retry(
         total=retries,
-        backoff_factor=1,
+        backoff_factor=0.5,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"]
     )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=pool_connections,
+        pool_maxsize=pool_maxsize
+    )
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
@@ -150,13 +158,25 @@ def extract_host_port(config: str) -> Tuple[Optional[str], Optional[int]]:
 
 
 def check_connection(config: str, timeout: float = DEFAULT_PING_TIMEOUT) -> Optional[str]:
-    """Check if a config node is reachable via TCP."""
+    """Check if a config node is reachable via TCP (IPv4 preferred, then IPv6)."""
     host, port = extract_host_port(config)
     if not host or not port:
         return None
+    
     try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            return config
+        # Try to resolve the host and connect
+        for addr_info in socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM):
+            family, socktype, proto, canonname, sockaddr = addr_info
+            try:
+                with socket.socket(family, socktype, proto) as sock:
+                    sock.settimeout(timeout)
+                    sock.connect(sockaddr)
+                    return config
+            except (socket.timeout, socket.error):
+                continue
+    except socket.gaierror:
+        # DNS resolution failed
+        pass
     except Exception:
         pass
     return None
@@ -191,7 +211,7 @@ def main():
     total_sources = len(BASE64_SOURCES) + len(PLAIN_SOURCES)
     logging.info("Fetching from %d sources...", total_sources)
 
-    session = create_session_with_retries(retries=args.retries, timeout=args.timeout)
+    session = create_session_with_retries(retries=args.retries, timeout=args.timeout, pool_connections=40, pool_maxsize=50)
     all_raw: List[str] = []
 
     try:
@@ -250,13 +270,18 @@ def main():
                 executor.submit(check_connection, c, args.ping_timeout)
                 for c in final_candidates
             ]
+            checked = 0
             for future in as_completed(futures):
                 try:
                     result = future.result()
                     if result:
                         alive_nodes.append(result)
+                    checked += 1
+                    if checked % max(1, len(final_candidates) // 20) == 0:
+                        logging.info("Progress: %d/%d nodes checked", checked, len(final_candidates))
                 except Exception as e:
                     logging.debug("Check failed: %s", e)
+                    checked += 1
 
         logging.info("Found %d alive nodes", len(alive_nodes))
 
