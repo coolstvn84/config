@@ -1,2 +1,3 @@
-# HY2 Configs - Updated 🤝
+# HY2 Configs - Updated
+# Count: 1
 hy2://123456789StrongPass@144.31.224.14:443/?insecure=1&sni=www.cloudflare.com#%3E%3E%40oneclickvpnkeys%3A%3AXX
